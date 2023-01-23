@@ -1,0 +1,329 @@
+library(beaker)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(ggridges)
+library(purrr)
+library(tidyr)
+
+# specify parameters ------------------------------------------------------
+experiment_id <- "22095320805"  ## preferred shopper priority test -- web, '21153650973' --app
+
+
+user_group_date_sql <- glue::glue(
+  "with exp_users as (SELECT 
+            rule_key as experiment_name, 
+            case when experiment_id = '22095320805' then 'web' 
+            else null end as platform_type,
+            VARIATION_KEY as test_group,
+            user_id, 
+            original_timestamp
+            FROM 
+                PRD_DATALAKEHOUSE.NG_VIEWS.ARISTOTLE_EXPERIMENT_ACTIVATION_EVENTS
+            WHERE 1=1
+            and experiment_id in ('22095320805')
+            --and TO_DATE(ORIGINAL_TIMESTAMP) >= '2022-11-01'
+            and TO_DATE(ORIGINAL_TIMESTAMP) <= '2022-11-15'
+            group by 1,2,3,4, 5
+            order by 1,2,3)
+            
+select 
+distinct
+user_id,
+test_group, 
+original_timestamp
+from exp_users
+  ")
+
+
+user_group_date_df <- query_shipt(drv = "ODBC",
+                                  env = local_user_snowflake(),
+                                  method = "fetch",
+                                  sql = user_group_date_sql,
+                                  retries = 1) %>% 
+  dplyr::rename_all(tolower) %>% 
+  tibble::as_tibble() 
+
+num_assign = user_group_date_df %>% group_by(user_id) %>%
+  summarise(num_assignment = n()) %>%
+  arrange(desc(num_assignment))
+
+#user_group_date_df %>% filter(user_id == 42360868) %>% arrange(original_timestamp)
+
+num_assign_clean = user_group_date_df %>% mutate(date = as.Date(original_timestamp)) %>%
+  select(user_id, test_group, date) %>%
+  distinct() %>%
+  group_by(user_id) %>%
+  summarise(num_assignment = n()) %>%
+  arrange(desc(num_assignment))
+user_group_date_df %>% mutate(date = as.Date(original_timestamp)) %>%
+  select(user_id, test_group, date) %>%
+  distinct() %>% filter(user_id == 42360868) %>% arrange(date)
+
+glimpse(num_assign_clean)
+
+
+
+### how many users that were assigned in both groups ----
+unique(user_group_date_df$test_group)
+
+user_num_group = user_group_date_df %>%
+  select(user_id, test_group) %>%
+  distinct() %>%
+  group_by(user_id) %>%
+  summarise(num_groups = n()) 
+
+table(user_num_group$num_groups)
+# data update
+# 1     2 
+# 59149  3388 
+
+
+#     1     2 
+# 51136  2903 
+
+
+table(user_num_group$num_groups)/nrow(user_num_group)
+# 94.63%, 5.37%  
+# TOREPORT: 5.37% that was assigned to be more than one group
+
+user_more_than_onegroup = user_num_group %>% filter(num_groups > 1) %>% 
+  select(user_id) %>% as.matrix() %>% as.vector()
+
+user_group_after50_50 = user_group_date_df %>% 
+  mutate(date = as.Date(original_timestamp)) %>%
+  filter(date >= as.Date('2022-11-01')) %>%
+  filter(date <= as.Date('2022-11-15')) %>%
+  select(user_id, test_group) %>%
+  distinct()
+table(user_group_after50_50$user_id %in% user_more_than_onegroup)
+# Updated data: are 3038
+# are 2557
+
+user_group_before50_50 = user_group_date_df %>%
+  mutate(date = as.Date(original_timestamp)) %>%
+  filter(date < as.Date('2022-11-01')) %>%
+  select(user_id) %>%
+  distinct()
+dim(user_group_before50_50)
+# 33053
+
+# excluding all the customres that entered before 2022-10-29
+user_group_after50_50_clean = user_group_after50_50 %>%
+  filter(!user_id %in% user_group_before50_50$user_id)
+
+table(user_group_after50_50_clean$test_group)
+#updated data
+# control variant 
+# 14754   14730
+
+
+#control variant 
+# 11940   11946
+
+nrow(user_group_after50_50_clean)
+# updated data
+# 29484
+
+# 23886
+
+glimpse(user_group_after50_50)
+
+## metrics  ----
+# Conversion Rate ----
+
+user_checkout_sql<- glue::glue(
+  "with exp_users as (SELECT 
+            --rule_key as experiment_name, 
+            --case when experiment_id = '22095320805' then 'web' 
+            --else null end as platform_type,
+            --VARIATION_KEY as test_group,
+            distinct user_id 
+            --original_timestamp
+            FROM 
+                PRD_DATALAKEHOUSE.NG_VIEWS.ARISTOTLE_EXPERIMENT_ACTIVATION_EVENTS
+            WHERE 1=1
+            and experiment_id in ('22095320805')
+            and TO_DATE(ORIGINAL_TIMESTAMP) >= '2022-11-01'
+            and TO_DATE(ORIGINAL_TIMESTAMP) <= '2022-11-15')
+            
+select e.user_id, e.user_id_universal, e.id as event_id, e.event_name, e.timestamp
+from PRD_SEGMENT_EVENTS.segway_production.user_core_events e
+right join exp_users u on e.user_id = u.user_id
+where e.EVENT_NAME in ('checkout_started', 'checkout_completed')
+and to_date(timestamp) between to_date('2022-11-01') and to_date('2022-11-15')
+and e.device = 'desktop'
+  ")
+
+user_checkout_df <- query_shipt(drv = "ODBC",
+                                env = local_user_snowflake(),
+                                method = "fetch",
+                                sql = user_checkout_sql,
+                                retries = 1) %>% 
+  dplyr::rename_all(tolower) %>% 
+  tibble::as_tibble() 
+dim(user_checkout_df)
+
+user_checkout_after50_50 = user_checkout_df %>% 
+  arrange(user_id, timestamp) %>%
+  inner_join(user_group_after50_50_clean, by='user_id')
+
+user_checkout_after50_50 %>% 
+  group_by(test_group) %>%
+  summarise(total_n_checkout_started = sum(event_name == 'checkout_started'), 
+            total_n_checkout_completed = sum(event_name == 'checkout_completed')) %>%
+  mutate(checkout_conversion = total_n_checkout_completed/total_n_checkout_started)
+
+#convert timestamp to date - create the start and end date for each customer while filtering to only customers with a window of at least 7 days
+#find the number of orders that is within the time frame for each customer
+
+glimpse(user_checkout_after50_50)
+# updated data
+# 59.20% for control
+# 58.90% for variant
+
+prop.test(x=c(14429, 14616), n=c(24356, 24835))
+# p-value = 0.3846
+
+
+# 58.5% control
+# 57.6%  variant
+
+prop.test(x=c(12646, 12802), n=c(21618, 22230))
+#  p-value = 0.05511
+
+# Order per customer ----
+
+user_num_orders = user_checkout_after50_50 %>%
+  group_by(user_id, test_group) %>%
+  summarise(num_orders = sum(event_name == 'checkout_completed'))
+
+glimpse(user_num_orders)
+
+num_orders_variant = user_num_orders%>%filter(test_group == 'variant')
+num_orders_control = user_num_orders%>%filter(test_group == 'control')
+
+t.test(num_orders_variant$num_orders, 
+       num_orders_control$num_orders)
+# updated data
+# 1.00 for control
+# 1.01 for variant
+# p-value = 0.1031
+
+
+# 1.08  control
+# 1.09  variant
+# p-value = 0.2616
+
+# ordering customer ----
+
+table(num_orders_variant$num_orders == 0)
+# updated data
+# FALSE  TRUE 
+# 12643  1803 
+
+
+# FALSE  TRUE
+# 10200  1533
+
+table(num_orders_control$num_orders == 0)
+# updated data
+# FALSE  TRUE 
+# 12527  1892
+
+
+
+# FALSE  TRUE 
+# 10139  1558 
+
+# updated data
+prop.test(x = c(12643, 12527), n = c(nrow(num_orders_variant), nrow(num_orders_control)))
+#variant 87.52%
+#control 87.00%
+# p-value = 0.1071
+
+
+prop.test(x = c(10200, 10139), n = c(nrow(num_orders_variant), nrow(num_orders_control)))
+# variant 86.93% 
+# control 86.69%
+
+#follow-up analysis ----
+
+user_group_date_clean_df = user_group_date_df %>%
+  right_join(user_num_orders, by=c('user_id')) %>%
+  filter(original_timestamp >= '2022-11-01')
+
+glimpse(user_group_date_clean_df)
+
+
+window_clean_df = user_group_date_clean_df %>%
+  mutate(date_window=as.numeric(as.Date('2022-11-15')-as.Date(original_timestamp)+1))
+
+glimpse(window_clean_df)
+
+summary(window_clean_df$date_window)
+#time window - about 7 days to exclude as few as possible
+
+table(window_clean_df$date_window < 7)/nrow(window_clean_df)
+
+working_window_df = window_clean_df %>%
+  filter(date_window >= 7) %>%
+  mutate(start_date=as.Date(original_timestamp), end_date=start_date+6)
+
+glimpse(working_window_df)
+
+summary(working_window_df$date_window)
+#checking to make sure everyone is in the window we are checking
+
+
+# Order per customer 2 ----
+
+
+
+num_orders_variantv2 = working_window_df%>%filter(test_group.x == 'variant')
+num_orders_controlv2 = working_window_df%>%filter(test_group.x == 'control')
+
+t.test(num_orders_variantv2$num_orders, 
+       num_orders_controlv2$num_orders)
+
+# Control 1.482
+# Variant 1.515
+# p-value 0.001
+
+#proportion of ordering customers 2 ----
+table(num_orders_variantv2$num_orders == 0)
+
+# FALSE  TRUE 
+# 22427-28863  3666 - 4553
+
+
+table(num_orders_controlv2$num_orders == 0)
+
+# FALSE  TRUE 
+# 19069 - 24683  3198 - 4103
+
+
+prop.test(x = c(28863, 24683), n = c(nrow(num_orders_variantv2), nrow(num_orders_controlv2)))
+# Control 86.37%
+# Variant 85.75%
+# p-value = 0.025
+
+#Checkout Conversion Rate 2 ----
+user_checkout_after50_50v2 = user_checkout_after50_50 %>%
+  mutate(date_window=as.numeric(as.Date('2022-11-15')-as.Date(timestamp)+1))
+working_checkout = user_checkout_after50_50v2%>%
+  filter(date_window >= 6)
+
+glimpse(working_checkout)
+summary(working_checkout$date_window)
+
+working_checkout %>% 
+  group_by(test_group) %>%
+  summarise(total_n_checkout_started = sum(event_name == 'checkout_started'), 
+            total_n_checkout_completed = sum(event_name == 'checkout_completed')) %>%
+  mutate(checkout_conversion = total_n_checkout_completed/total_n_checkout_started)
+# Control 58.7%
+# Variant 58.3%
+
+prop.test(x=c(20180, 20275), n=c(34361, 34757))
+# p-value 0.295
